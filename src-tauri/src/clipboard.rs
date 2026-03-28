@@ -21,6 +21,18 @@ fn paste_via_clipboard(
     paste_delay_ms: u64,
 ) -> Result<(), String> {
     let clipboard = app_handle.clipboard();
+
+    // On Wayland, prefer wl-paste to read current clipboard (Tauri's plugin
+    // may not work reliably without focus under Wayland's security model).
+    #[cfg(target_os = "linux")]
+    let clipboard_content = if is_wayland() && is_wl_paste_available() {
+        info!("Using wl-paste for clipboard read on Wayland");
+        read_clipboard_via_wl_paste().unwrap_or_default()
+    } else {
+        clipboard.read_text().unwrap_or_default()
+    };
+
+    #[cfg(not(target_os = "linux"))]
     let clipboard_content = clipboard.read_text().unwrap_or_default();
 
     // Write text to clipboard first
@@ -278,6 +290,36 @@ fn is_wl_copy_available() -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+/// Check if wl-paste is available (Wayland clipboard read tool)
+#[cfg(target_os = "linux")]
+fn is_wl_paste_available() -> bool {
+    Command::new("which")
+        .arg("wl-paste")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Read text from the Wayland clipboard via wl-paste.
+/// This is more reliable than Tauri's clipboard plugin on Wayland because
+/// the Wayland protocol only allows the focused client to access the
+/// data_device selection — wl-paste works around this.
+#[cfg(target_os = "linux")]
+fn read_clipboard_via_wl_paste() -> Result<String, String> {
+    let output = Command::new("wl-paste")
+        .arg("--no-newline")
+        .output()
+        .map_err(|e| format!("Failed to execute wl-paste: {}", e))?;
+
+    if !output.status.success() {
+        // wl-paste exits with non-zero when clipboard is empty — that's fine
+        return Ok(String::new());
+    }
+
+    String::from_utf8(output.stdout)
+        .map_err(|e| format!("wl-paste returned non-UTF8 data: {}", e))
 }
 
 /// Type text directly via wtype on Wayland.
@@ -653,10 +695,23 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
 
     // After pasting, optionally copy to clipboard based on settings
     if settings.clipboard_handling == ClipboardHandling::CopyToClipboard {
-        let clipboard = app_handle.clipboard();
-        clipboard
-            .write_text(&text)
-            .map_err(|e| format!("Failed to copy to clipboard: {}", e))?;
+        #[cfg(target_os = "linux")]
+        if is_wayland() && is_wl_copy_available() {
+            write_clipboard_via_wl_copy(&text)?;
+        } else {
+            let clipboard = app_handle.clipboard();
+            clipboard
+                .write_text(&text)
+                .map_err(|e| format!("Failed to copy to clipboard: {}", e))?;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let clipboard = app_handle.clipboard();
+            clipboard
+                .write_text(&text)
+                .map_err(|e| format!("Failed to copy to clipboard: {}", e))?;
+        }
     }
 
     Ok(())

@@ -167,12 +167,22 @@ pub enum RecordingRetentionPeriod {
 pub enum KeyboardImplementation {
     Tauri,
     HandyKeys,
+    /// XDG Desktop Portal GlobalShortcuts — the Wayland-native approach.
+    /// Only functional on Linux with a portal-capable compositor.
+    Portal,
 }
 
 impl Default for KeyboardImplementation {
     fn default() -> Self {
         #[cfg(target_os = "linux")]
-        return KeyboardImplementation::Tauri;
+        {
+            // On Wayland default to Portal (XDG GlobalShortcuts);
+            // on X11 keep Tauri which uses XGrabKey and works fine.
+            if crate::utils::is_wayland() {
+                return KeyboardImplementation::Portal;
+            }
+            return KeyboardImplementation::Tauri;
+        }
         #[cfg(not(target_os = "linux"))]
         return KeyboardImplementation::HandyKeys;
     }

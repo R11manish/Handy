@@ -3,14 +3,17 @@
 //! This module provides a unified interface for keyboard shortcuts with
 //! multiple backend implementations:
 //!
-//! - `tauri`: Uses Tauri's built-in global-shortcut plugin
-//! - `handy_keys`: Uses the handy-keys library for more control
+//! - `tauri`: Uses Tauri's built-in global-shortcut plugin (X11)
+//! - `handy_keys`: Uses the handy-keys library for more control (macOS primary)
+//! - `portal`: Uses XDG Desktop Portal GlobalShortcuts (Wayland-native, Linux only)
 //!
 //! The active implementation is determined by the `keyboard_implementation`
 //! setting and can be changed at runtime.
 
 mod handler;
 pub mod handy_keys;
+#[cfg(target_os = "linux")]
+mod portal_impl;
 mod tauri_impl;
 
 use log::{error, info, warn};
@@ -53,6 +56,35 @@ pub fn init_shortcuts(app: &AppHandle) {
                 tauri_impl::init_shortcuts(app);
             }
         }
+        KeyboardImplementation::Portal => {
+            #[cfg(target_os = "linux")]
+            {
+                if let Err(e) = portal_impl::init_shortcuts(app) {
+                    error!("Failed to initialize XDG Portal shortcuts: {}", e);
+                    // Fall back to Tauri implementation (works via XWayland on most setups)
+                    warn!("Falling back to Tauri global shortcut implementation");
+
+                    let mut settings = settings::get_settings(app);
+                    settings.keyboard_implementation = KeyboardImplementation::Tauri;
+                    settings::write_settings(app, settings);
+
+                    tauri_impl::init_shortcuts(app);
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Portal is Linux-only; fall back to HandyKeys on other platforms
+                warn!("Portal shortcuts are only available on Linux, falling back to HandyKeys");
+                let mut settings = settings::get_settings(app);
+                settings.keyboard_implementation = KeyboardImplementation::HandyKeys;
+                settings::write_settings(app, settings);
+
+                if let Err(e) = handy_keys::init_shortcuts(app) {
+                    error!("HandyKeys fallback also failed: {}", e);
+                    tauri_impl::init_shortcuts(app);
+                }
+            }
+        }
     }
 }
 
@@ -62,6 +94,10 @@ pub fn register_cancel_shortcut(app: &AppHandle) {
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => tauri_impl::register_cancel_shortcut(app),
         KeyboardImplementation::HandyKeys => handy_keys::register_cancel_shortcut(app),
+        KeyboardImplementation::Portal => {
+            #[cfg(target_os = "linux")]
+            portal_impl::register_cancel_shortcut(app);
+        }
     }
 }
 
@@ -71,6 +107,10 @@ pub fn unregister_cancel_shortcut(app: &AppHandle) {
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => tauri_impl::unregister_cancel_shortcut(app),
         KeyboardImplementation::HandyKeys => handy_keys::unregister_cancel_shortcut(app),
+        KeyboardImplementation::Portal => {
+            #[cfg(target_os = "linux")]
+            portal_impl::unregister_cancel_shortcut(app);
+        }
     }
 }
 
@@ -80,6 +120,12 @@ pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<()
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => tauri_impl::register_shortcut(app, binding),
         KeyboardImplementation::HandyKeys => handy_keys::register_shortcut(app, binding),
+        KeyboardImplementation::Portal => {
+            #[cfg(target_os = "linux")]
+            return portal_impl::register_shortcut(app, binding);
+            #[cfg(not(target_os = "linux"))]
+            Err("Portal shortcuts are only available on Linux".into())
+        }
     }
 }
 
@@ -89,6 +135,12 @@ pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => tauri_impl::unregister_shortcut(app, binding),
         KeyboardImplementation::HandyKeys => handy_keys::unregister_shortcut(app, binding),
+        KeyboardImplementation::Portal => {
+            #[cfg(target_os = "linux")]
+            return portal_impl::unregister_shortcut(app, binding);
+            #[cfg(not(target_os = "linux"))]
+            Err("Portal shortcuts are only available on Linux".into())
+        }
     }
 }
 
@@ -282,10 +334,20 @@ pub fn change_keyboard_implementation_setting(
     settings.keyboard_implementation = new_impl;
     settings::write_settings(&app, settings);
 
-    // Initialize new implementation if needed (HandyKeys needs state)
+    // Initialize new implementation if needed (HandyKeys/Portal need managed state)
     if new_impl == KeyboardImplementation::HandyKeys {
         if initialize_handy_keys_with_rollback(&app)? {
             // Shortcuts already registered during init
+            return Ok(ImplementationChangeResult {
+                success: true,
+                reset_bindings: vec![],
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    if new_impl == KeyboardImplementation::Portal {
+        if initialize_portal_with_rollback(&app)? {
             return Ok(ImplementationChangeResult {
                 success: true,
                 reset_bindings: vec![],
@@ -322,6 +384,7 @@ pub fn get_keyboard_implementation(app: AppHandle) -> String {
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => "tauri".to_string(),
         KeyboardImplementation::HandyKeys => "handy_keys".to_string(),
+        KeyboardImplementation::Portal => "portal".to_string(),
     }
 }
 
@@ -337,6 +400,12 @@ fn validate_shortcut_for_implementation(
     match implementation {
         KeyboardImplementation::Tauri => tauri_impl::validate_shortcut(raw),
         KeyboardImplementation::HandyKeys => handy_keys::validate_shortcut(raw),
+        KeyboardImplementation::Portal => {
+            #[cfg(target_os = "linux")]
+            return portal_impl::validate_shortcut(raw);
+            #[cfg(not(target_os = "linux"))]
+            Err("Portal shortcuts are only available on Linux".into())
+        }
     }
 }
 
@@ -345,6 +414,7 @@ fn parse_keyboard_implementation(s: &str) -> KeyboardImplementation {
     match s {
         "tauri" => KeyboardImplementation::Tauri,
         "handy_keys" => KeyboardImplementation::HandyKeys,
+        "portal" => KeyboardImplementation::Portal,
         other => {
             warn!(
                 "Invalid keyboard implementation '{}', defaulting to tauri",
@@ -368,6 +438,12 @@ fn unregister_all_shortcuts(app: &AppHandle, implementation: KeyboardImplementat
         let result = match implementation {
             KeyboardImplementation::Tauri => tauri_impl::unregister_shortcut(app, binding),
             KeyboardImplementation::HandyKeys => handy_keys::unregister_shortcut(app, binding),
+            KeyboardImplementation::Portal => {
+                #[cfg(target_os = "linux")]
+                { portal_impl::unregister_shortcut(app, binding) }
+                #[cfg(not(target_os = "linux"))]
+                Ok(())
+            }
         };
 
         if let Err(e) = result {
@@ -426,6 +502,12 @@ fn register_all_shortcuts_for_implementation(
         let result = match implementation {
             KeyboardImplementation::Tauri => tauri_impl::register_shortcut(app, binding),
             KeyboardImplementation::HandyKeys => handy_keys::register_shortcut(app, binding),
+            KeyboardImplementation::Portal => {
+                #[cfg(target_os = "linux")]
+                { portal_impl::register_shortcut(app, binding) }
+                #[cfg(not(target_os = "linux"))]
+                Err("Portal shortcuts are only available on Linux".into())
+            }
         };
 
         if let Err(e) = result {
@@ -459,6 +541,33 @@ fn initialize_handy_keys_with_rollback(app: &AppHandle) -> Result<bool, String> 
         tauri_impl::init_shortcuts(app);
         return Err(format!(
             "Failed to initialize HandyKeys: {}. Reverted to Tauri.",
+            e
+        ));
+    }
+
+    // init_shortcuts already registered shortcuts
+    Ok(true)
+}
+
+/// Initialize Portal if not already initialized, with rollback on failure
+#[cfg(target_os = "linux")]
+fn initialize_portal_with_rollback(app: &AppHandle) -> Result<bool, String> {
+    if app
+        .try_state::<portal_impl::PortalState>()
+        .is_some()
+    {
+        return Ok(false); // Already initialized, caller should continue
+    }
+
+    if let Err(e) = portal_impl::init_shortcuts(app) {
+        error!("Failed to initialize Portal shortcuts: {}", e);
+        // Rollback to Tauri
+        let mut settings = settings::get_settings(app);
+        settings.keyboard_implementation = KeyboardImplementation::Tauri;
+        settings::write_settings(app, settings);
+        tauri_impl::init_shortcuts(app);
+        return Err(format!(
+            "Failed to initialize Portal shortcuts: {}. Reverted to Tauri.",
             e
         ));
     }
